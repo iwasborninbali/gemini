@@ -1,0 +1,15 @@
+{
+  "model_name": "gemini-2.5-pro-preview-05-06",
+  "api_base_url": "https://generativelanguage.googleapis.com/v1beta/models",
+  "system_prompt_file": "config/system_prompt.txt",
+  "history_dir": "history",
+  "history_file": "conversation_log.json",
+  "summarization": {
+    "enabled": true,
+    "model_name": "gemini-2.5-flash-preview-04-17",
+    "threshold_messages": 30,
+    "summarize_ratio": 1,
+    "context_keep_messages": 15
+  },
+  "rewrite_model_name": "gemini-2.5-flash-preview-04-17"
+} 

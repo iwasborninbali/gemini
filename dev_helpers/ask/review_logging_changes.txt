@@ -1,0 +1,18 @@
+Review the recent changes made to the project to implement verbose logging control and detailed network error logging.
+
+The primary goal was to reduce console log verbosity by introducing a `verbose` flag in various modules and to log detailed network errors to a file.
+
+Key files modified:
+- `gemini.py`: Main orchestration, calls other modules with `verbose=False`, handles network error logging to `network_errors.log`.
+- `tools/file_creator.py` (handle_create_file): Added `verbose` flag to control its `FILE_CREATOR:` print statements.
+- `tools/file_modifier.py` (handle_apply_diff): Added `verbose` flag to control its `logger.info/debug` statements.
+- `utils/tool_parser.py` (parse_tool_call): Added `verbose` flag to control its `PARSER:` print statements.
+- `tools/command_executor.py` (run_command): Added `verbose` flag to control its `ИСПОЛНЕНИЕ:` print statements.
+
+Please check:
+1.  Correctness of `verbose` flag implementation and propagation in all mentioned files.
+2.  Appropriate suppression of logs when `verbose=False` is active.
+3.  Effectiveness and completeness of network error logging in `gemini.py` (e.g., are relevant error details, request context, and response previews logged to `network_errors.log`?).
+4.  Ensure that critical error messages (e.g., `logger.error`, `logger.warning`, or direct error messages returned to `gemini.py`) are NOT suppressed by the `verbose` flag.
+5.  General code quality, adherence to Python best practices, and whether the changes meet the user's requirements for cleaner console output and better error diagnostics.
+6.  Confirm that `gemini.py` correctly calls the modified functions with `verbose=False`. 

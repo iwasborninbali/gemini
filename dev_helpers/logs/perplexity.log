@@ -1,0 +1,23 @@
+2025-05-07 03:20:54,219 - INFO - Final query sent to Perplexity AI:
+gcloud command to lookup api key project
+2025-05-07 03:21:13,523 - INFO - Perplexity research result:
+To find the project associated with an API key using gcloud, use the `lookup` command followed by the key string:
+
+```bash
+gcloud services api-keys lookup YOUR_API_KEY_STRING
+```
+
+This returns the resource name in the format:  
+`projects/PROJECT_NUMBER/locations/global/keys/KEY_ID`
+
+Key details from the implementation:
+- The command only requires the key string itself as input[2]
+- Shows the full resource path including the numeric project number[2]
+- Works for both active and deleted keys (if combined with `--show-deleted` flag)[1]
+
+To get the human-readable project ID from the numeric project number:  
+```bash
+gcloud projects describe PROJECT_NUMBER --format="value(projectId)"
+```
+
+This approach is recommended in Google's official CLI documentation[2][5] and avoids security risks of listing all keys. For production environments, consider using secret management systems instead of raw API keys[3].
