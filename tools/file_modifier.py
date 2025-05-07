@@ -8,6 +8,7 @@ import time
 import logging
 from pathlib import Path
 from typing import Optional, Tuple
+import difflib
 
 logger = logging.getLogger(__name__)
 
@@ -23,16 +24,19 @@ REWRITER_SYSTEM_PROMPT = """
 You are an AI assistant that rewrites entire files based on instructions.
 The user will provide:
 1. The full original content of a file.
-2. A snippet describing the desired code change, potentially using syntax like '// ... existing code ...'.
-3. [Optional] Feedback from a previous verification step if the last attempt failed.
+2. A high-level description of the desired changes (e.g., "Add a new parameter to the function X", "Refactor the loop in Y to use a list comprehension").
+3. One or more specific code snippets illustrating the exact changes to be made. These snippets will use comments like '// ... existing code ...' or '# ... existing code ...' to denote unchanged parts of the file around the modifications.
+4. [Optional] Feedback from a previous verification step if the last attempt failed.
 
 Your task is to:
-1. Understand the desired change described in the snippet.
-2. Apply ONLY that single, specific change to the provided original file content.
-3. **If verification feedback is provided, pay close attention to it and ensure your new rewrite addresses the described issues.**
-4. Return the ENTIRE modified file content as plain text.
-5. IMPORTANT: Do NOT add any explanations, comments, or markdown formatting (like ```) around the returned code. Your output should be ONLY the raw, complete, modified file content, suitable for direct writing to a file.
-6. Preserve the original formatting, indentation, and structure of the unchanged parts of the file as accurately as possible.
+1. Understand the overall goal from the "Desired Changes Description".
+2. Carefully analyze the provided "Change Snippets" and the "Original File Content".
+3. Apply ONLY the specific modifications shown in the "Change Snippets" to the "Original File Content". Ensure that the context provided by '... existing code ...' comments is correctly matched.
+4. The applied changes should align with the high-level "Desired Changes Description".
+5. **If verification feedback is provided, pay close attention to it and ensure your new rewrite addresses the described issues.**
+6. Return the ENTIRE modified file content as plain text.
+7. IMPORTANT: Do NOT add any explanations, comments, or markdown formatting (like ```) around the returned code. Your output should be ONLY the raw, complete, modified file content, suitable for direct writing to a file.
+8. Preserve the original formatting, indentation, and structure of the unchanged parts of the file as accurately as possible.
 """
 
 VERIFIER_SYSTEM_PROMPT = """
@@ -40,14 +44,16 @@ You are an AI code verification assistant. Your task is to analyze a code rewrit
 
 You will receive the following inputs:
 1.  **Original File Content:** The complete code before any changes.
-2.  **Change Snippet:** The instruction provided to the rewriter, describing the intended change.
-3.  **Rewritten File Content:** The complete code produced by the rewriter.
+2.  **Desired Changes Description:** A high-level textual description of what the user wants to achieve.
+3.  **Change Snippets:** One or more specific code snippets illustrating the exact changes that were supposed to be made, using comments like '// ... existing code ...' or '# ... existing code ...' to denote unchanged parts.
+4.  **Rewritten File Content:** The complete code produced by the rewriter.
 
 Your evaluation criteria:
-1.  **Correct Change Application:** Was the specific change described in the "Change Snippet" applied correctly in the "Rewritten File Content"?
-2.  **No Unintended Changes:** Were there any modifications made to the code *outside* the scope of the requested change? (Minor whitespace/formatting changes related to the edit are acceptable, but logic/code structure changes are not unless requested).
-3.  **Structure Preservation:** Does the "Rewritten File Content" maintain the overall structure, logic, and comments of the "Original File Content" in the unchanged parts?
-4.  **Basic Syntax:** Does the rewritten code appear syntactically valid for its likely language? (This is a basic check, not a full compilation).
+1.  **Correct Change Application:** Were the specific changes illustrated in the "Change Snippets" applied correctly and in the intended locations within the "Rewritten File Content"?
+2.  **Alignment with Description:** Do the applied changes accurately reflect the intent described in the "Desired Changes Description"?
+3.  **No Unintended Changes:** Were there any modifications made to the code *outside* the scope of the requested changes as shown in the "Change Snippets"? (Minor whitespace/formatting changes related to the edit are acceptable, but logic/code structure changes are not unless explicitly part of the snippets or description).
+4.  **Structure Preservation:** Does the "Rewritten File Content" maintain the overall structure, logic, and comments of the "Original File Content" in the unchanged parts?
+5.  **Basic Syntax:** Does the rewritten code appear syntactically valid for its likely language? (This is a basic check, not a full compilation).
 
 Based on your analysis, you MUST return ONLY a JSON object with the following structure:
 
@@ -80,29 +86,51 @@ IMPORTANT: Respond ONLY with the JSON object. Do not add any introductory text, 
 
 # --- Helper function to clean Gemini response ---
 def clean_gemini_rewriter_response(content: str, verbose: bool = True) -> str:
-    """Removes markdown code fences if they wrap the entire response."""
-    # Same logic as in file_creator
-    if content and content.startswith("```") and content.endswith("```"):
-        lines = content.splitlines()
-        if len(lines) > 1:
-            first_line_content = lines[0][3:].strip()
-            if (
-                first_line_content
-                and " " not in first_line_content
-                and len(first_line_content) < 15
-            ):
-                cleaned = "\n".join(lines[1:-1])
-            else:
-                cleaned = "\n".join(lines[:-1])
-                if cleaned.startswith("```"):
-                    cleaned = cleaned[3:]
-            if cleaned.strip():
-                if verbose:
-                    logger.debug(
-                        "Removed Markdown code fences from Gemini rewriter response."
-                    )
-                return cleaned
-    return content
+    """
+    Strips a *single* outer wrapper (```‑фенсы, <pre><code>, <code>, <script>)
+    that some LLMs add around the file body.  
+    Leaves internal markup intact.
+    """
+    if not content:
+        return content
+
+    text = content.strip()
+
+    # (opening‑regex, closing‑regex) pairs — проверяем по порядку
+    wrappers: tuple[tuple[str, str], ...] = (
+        (r"^```(?:\w+)?\\s*\n?", r"\\n?```$"),                       # ```python … ```
+        (r"^<pre[^>]*>\\s*<code[^>]*>\\s*", r"\\s*</code>\\s*</pre>$"), # <pre><code> … </code></pre>
+        (r"^<code[^>]*>\\s*", r"\\s*</code>$"),                       # <code> … </code>
+        (r"^<script[^>]*>\\s*", r"\\s*</script>$"),                   # <script> … </script>
+    )
+
+    for open_pat, close_pat in wrappers:
+        if re.match(open_pat, text, re.IGNORECASE | re.DOTALL) and \
+           re.search(close_pat, text, re.IGNORECASE | re.DOTALL):
+            text = re.sub(open_pat, "", text, 1, re.IGNORECASE | re.DOTALL)
+            text = re.sub(close_pat, "", text, 1, re.IGNORECASE | re.DOTALL)
+            if verbose:
+                logger.debug(
+                    f"Removed wrapper matching /{open_pat}/ … /{close_pat}/"
+                )
+            text = text.strip()
+
+    # Убираем одиночные HTML‑комментарии, которые иногда вставляются LLM‑ом
+    text = re.sub(r"^\\s*<!--.*?-->\\s*", "", text, flags=re.DOTALL)
+    text = re.sub(r"\\s*<!--.*?-->\\s*$", "", text, flags=re.DOTALL)
+
+    return text
+
+
+# --- NEW helper ---
+def strip_lonely_fences(text: str) -> str:
+    """Если файл начинается/заканчивается строкой ```*, убираем её."""
+    lines = text.splitlines()
+    if lines and re.match(r"^```", lines[0].strip()):
+        lines = lines[1:]
+    if lines and re.match(r"^```", lines[-1].strip()):
+        lines = lines[:-1]
+    return "\n".join(lines)
 
 
 # --- API Call Function ---
@@ -307,38 +335,41 @@ def write_final_content(path: Path, content: str, verbose: bool = True):
 # --- Main Tool Backend Function ---
 def handle_apply_diff(
     target_file: str,
-    diff_content: str,  # Renamed from json_string for clarity, now passed directly
+    change_snippets: str, # Renamed from diff_content
+    desired_changes_description: str, # New parameter
     project_root: Path,
     api_key: Optional[str] = None,
     model_name: Optional[str] = None,
     rewriter_model_override: Optional[str] = None,
     verifier_model_override: Optional[str] = None,
     verbose: bool = True
-) -> Tuple[bool, str, Optional[str]]:  # Return includes potential verifier comment
+) -> Tuple[bool, str, Optional[str], Optional[str]]:  # Return includes potential verifier comment AND diff string
     """
     Handles the apply_diff tool request using a rewrite/verify loop.
 
     Args:
         target_file: Relative path of the file to modify.
-        diff_content: The change snippet/description provided by the LLM.
+        change_snippets: The code snippets illustrating the changes, using '... existing code ...' syntax.
+        desired_changes_description: A natural language description of the overall desired changes.
         project_root: The root directory of the project.
         api_key: Gemini API key.
         model_name: Gemini model name for rewriting/verifying (e.g., MODEL_REWRITE).
 
     Returns:
-        Tuple (success: bool, message: str, verifier_comment: Optional[str])
+        Tuple (success: bool, message: str, verifier_comment: Optional[str], diff_str: Optional[str])
     """
     if verbose:
         logger.info("--- Entering handle_apply_diff (Rewriter/Verifier Logic) ---")
     logger.debug(
         f"Target File: {target_file}, Model: {model_name}, Project Root: {project_root}"
     )
-    logger.debug(f"Diff Content Snippet: {diff_content[:200]}...")
+    logger.debug(f"Desired Changes Description: {desired_changes_description[:200]}...")
+    logger.debug(f"Change Snippets: {change_snippets[:200]}...")
 
     if not api_key or not model_name:
         msg = f"Error: API Key or Model Name missing for apply_diff ('{target_file}'). Cannot proceed."
         logger.error(msg)
-        return False, msg, None
+        return False, msg, None, None
 
     # Resolve path relative to project_root
     target_path_obj = Path(target_file)
@@ -352,7 +383,7 @@ def handle_apply_diff(
         except ValueError:
             error_msg = f"Error: Absolute path '{target_path_obj}' is outside the project root '{project_root}'. Modification disallowed."
             logger.error(error_msg)
-            return False, error_msg, None
+            return False, error_msg, None, None
     else:
         target_file_abs = (project_root / target_file).resolve()
 
@@ -360,7 +391,7 @@ def handle_apply_diff(
     if project_root not in target_file_abs.parents and target_file_abs != project_root:
         error_msg = f"Error: Resolved path '{target_file_abs}' for apply_diff is outside the project root '{project_root}'. Modification disallowed."
         logger.error(error_msg)
-        return False, error_msg, None
+        return False, error_msg, None, None
 
     logger.info(f"Resolved absolute path for modification: {target_file_abs}")
 
@@ -370,6 +401,7 @@ def handle_apply_diff(
         return (
             False,
             f"Error: Could not read original file {target_file} (at {target_file_abs}). Cannot apply diff.",
+            None,
             None,
         )
 
@@ -387,7 +419,8 @@ def handle_apply_diff(
         # === Rewriter Step ===
         rewriter_prompt = (
             f"Original File Content:\n```\n{original_file_content}\n```\n\n"
-            + f"Change Snippet:\n```\n{diff_content}\n```"
+            f"Desired Changes Description:\n{desired_changes_description}\n\n"
+            f"Change Snippets:\n```\n{change_snippets}\n```"
             + (
                 f"\n\nVerification Feedback from previous attempt:\n{last_verifier_comment}"
                 if attempt > 1
@@ -408,16 +441,18 @@ def handle_apply_diff(
             logger.error(f"Rewriter API call failed on attempt {attempt}. Aborting.")
             # Use the last known verifier comment if available
             error_msg = f"Error: Rewriter API call failed for '{target_file}'. {last_verifier_comment}"
-            return False, error_msg, last_verifier_comment
+            return False, error_msg, last_verifier_comment, None
 
         # Clean potential markdown fences from the raw response
         rewritten_content = clean_gemini_rewriter_response(rewritten_content_raw, verbose=verbose)
+        rewritten_content = strip_lonely_fences(rewritten_content)
+
         if not rewritten_content:
             logger.error(
                 f"Rewriter returned empty content after cleaning on attempt {attempt}. Aborting."
             )
             error_msg = f"Error: Rewriter returned empty content for '{target_file}'. {last_verifier_comment}"
-            return False, error_msg, last_verifier_comment
+            return False, error_msg, last_verifier_comment, None
 
         final_rewritten_content = rewritten_content  # Store the latest attempt
         logger.debug(
@@ -427,8 +462,9 @@ def handle_apply_diff(
         # === Verifier Step ===
         verifier_prompt = (
             f"Original File Content:\n```\n{original_file_content}\n```\n\n"
-            + f"Change Snippet:\n```\n{diff_content}\n```\n\n"
-            + f"Rewritten File Content:\n```\n{final_rewritten_content}\n```"
+            f"Desired Changes Description:\n{desired_changes_description}\n\n"
+            f"Change Snippets:\n```\n{change_snippets}\n```\n\n"
+            f"Rewritten File Content:\n```\n{final_rewritten_content}\n```"
         )
         logger.info("Calling Verifier Model...")
         verifier_response = call_gemini_api(
@@ -481,7 +517,18 @@ def handle_apply_diff(
             if write_success:
                 final_message = f"File '{target_file}' successfully modified and verified. Path: {target_file_abs}"
                 logger.info(final_message)
-                return True, final_message, None
+                
+                diff_str = None
+                if original_file_content is not None: # final_rewritten_content is the content just written
+                    diff_lines = difflib.unified_diff(
+                        original_file_content.splitlines(keepends=True),
+                        final_rewritten_content.splitlines(keepends=True),
+                        fromfile=f"{target_file_abs.name}.original",
+                        tofile=f"{target_file_abs.name}.modified",
+                        lineterm=''
+                    )
+                    diff_str = "".join(diff_lines)
+                return True, final_message, None, diff_str
             else:
                 # Write failed after verification passed
                 error_msg = f"Verification passed, but failed to write changes to file '{target_file}'. Error during write operation. Original file restored."  # Added restore info
@@ -494,12 +541,12 @@ def handle_apply_diff(
                         logger.error(
                             f"FAILED TO RESTORE original content to {target_file_abs}"
                         )
-                return False, error_msg, last_verifier_comment  # Still return comment
+                return False, error_msg, last_verifier_comment, diff_str
 
         except Exception as e:
             error_msg = f"Error: Verification passed, but failed to write changes to file '{target_file}' at '{target_file_abs}': {e}"
             logger.error(error_msg, exc_info=True)
-            return False, error_msg, last_verifier_comment
+            return False, error_msg, last_verifier_comment, diff_str
     else:
         # Verification failed after all retries or rewrite failed
         error_msg = f"Error: Failed to modify file '{target_file}' after {MAX_RETRIES} verification attempts. Last verifier comment: {last_verifier_comment}"
@@ -514,7 +561,7 @@ def handle_apply_diff(
                 logger.error(
                     f"FAILED TO RESTORE original content to {target_file_abs} after failed attempts."
                 )
-        return False, error_msg, last_verifier_comment
+        return False, error_msg, last_verifier_comment, None
 
 
 # Keep main for potential standalone testing
@@ -525,7 +572,8 @@ if __name__ == "__main__":
     test_original = (
         'def greet(name):\n    print(f"Hello, {name}!")\n\ngreet("World")\n'  # Original
     )
-    test_diff = '// ... existing code ...\ndef greet(name, enthusiasm="!"):\n    print(f"Hello, {name}{enthusiasm}")\n// ... existing code ...'  # Change
+    test_snippets = '// ... existing code ...\ndef greet(name, enthusiasm="!"):\n    print(f"Hello, {name}{enthusiasm}")\n// ... existing code ...'  # Change snippets
+    test_description = "Add an optional 'enthusiasm' parameter to the greet function and use it in the print statement."
     test_api_key = os.getenv("GEMINI_API_KEY")
     test_model = os.getenv("MODEL_REWRITE", "gemini-1.5-flash-latest")
     cwd = Path.cwd()
@@ -544,9 +592,10 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    success, message, comment = handle_apply_diff(
+    success, message, comment, diff = handle_apply_diff(
         target_file=str(test_file_path.relative_to(cwd)),  # Pass relative path
-        diff_content=test_diff,
+        change_snippets=test_snippets,
+        desired_changes_description=test_description,
         project_root=cwd,
         api_key=test_api_key,
         model_name=test_model,
@@ -559,3 +608,5 @@ if __name__ == "__main__":
         print(f"Verifier Comment: {comment}")
     if success:
         print(f"Check the modified file: {test_file_path}")
+        if diff:
+            print(f"Generated Diff:\n{diff}")
